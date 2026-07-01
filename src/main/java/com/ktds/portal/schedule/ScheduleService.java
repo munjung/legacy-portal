@@ -1,0 +1,81 @@
+package com.ktds.portal.schedule;
+
+import com.ktds.portal.common.FileAuditLogger;
+import com.ktds.portal.user.User;
+import com.ktds.portal.user.UserRepository;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+
+/**
+ * 일정 서비스.
+ * [스멜4] 감사 로그 코드가 또 복붙. [스멜] 시간 겹침(중복 예약) 검증이 길고 읽기 어렵다.
+ */
+@Service
+public class ScheduleService {
+
+    private final ScheduleRepository repo;
+    private final UserRepository userRepo;
+    private final FileAuditLogger audit = new FileAuditLogger();
+
+    public ScheduleService(ScheduleRepository repo, UserRepository userRepo) {
+        this.repo = repo;
+        this.userRepo = userRepo;
+    }
+
+    public Schedule create(String title, Long ownerId, LocalDateTime startAt,
+                           LocalDateTime endAt, String location) {
+        // [스멜2] 검증 + 중복확인 + 저장 + 로그가 한 덩어리.
+        if (title == null || title.equals("")) {   // [스멜] "".equals 가 아니라 NPE 위험 패턴
+            return null;
+        }
+        if (startAt == null || endAt == null) {
+            return null;
+        }
+        if (endAt.isBefore(startAt)) {
+            return null;
+        }
+        // [스멜] 같은 사람의 시간 겹침을 직접 루프 돌며 확인(읽기 어려움).
+        boolean flag1 = false;   // [스멜9] flag1 = 무슨 깃발? isOverlapping 같은 이름이어야 함
+        for (Schedule s : repo.findByOwnerId(ownerId)) {
+            if (s.getStatus() != 9) {   // status!=9 → 취소(9)된 일정은 겹침 검사 제외
+                if (s.getStartAt().isBefore(endAt) && startAt.isBefore(s.getEndAt())) {
+                    flag1 = true;       // 시간대가 겹침 (이 조건식 자체도 메서드로 추출 대상)
+                }
+            }
+        }
+        if (flag1) {
+            return null;   // [스멜] null 반환 — 호출자는 '겹쳐서 실패'인지 원인을 모름
+        }
+
+        Schedule sc = new Schedule();
+        sc.setTitle(title);
+        sc.setOwnerId(ownerId);
+        sc.setStartAt(startAt);
+        sc.setEndAt(endAt);
+        sc.setLocation(location);
+        sc.setStatus(0);   // 0 = 예정 (확정 전)
+        repo.save(sc);
+
+        // [스멜4] 또 복붙된 감사 로그.
+        String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        audit.write("[" + now + "] SCHEDULE CREATE id=" + sc.getId() + " by=" + ownerId);
+        return sc;
+    }
+
+    public void confirm(Long id, Long userId) {
+        Schedule sc = repo.findById(id).orElse(null);
+        if (sc == null) return;
+        User u = userRepo.findById(userId).orElse(null);
+        if (u == null) return;
+        if (sc.getOwnerId().equals(userId)) {   // 본인 일정만 확정 가능
+            if (sc.getStatus() == 0) {          // status==0 → 예정 상태일 때만
+                sc.setStatus(1);   // 1 = 확정 (CONFIRMED)
+                repo.save(sc);
+                String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+                audit.write("[" + now + "] SCHEDULE CONFIRM id=" + sc.getId() + " by=" + userId);
+            }
+        }
+    }
+}
