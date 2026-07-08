@@ -16,7 +16,8 @@ import java.util.List;
  * ============================ 의도적으로 심어둔 스멜 목록 ============================
  *  1. God Class            : 검증 + 영속화 + 메일 + 감사로그 + 포맷팅 + 권한판정을 혼자 다 한다.
  *  2. Long Method          : processApproval() 한 메서드가 100줄 이상, 중첩 if 6단계.
- *  3. Magic Number         : status 0/1/2/3/9, type 1~4, role 1~3, priority 1~3 이 흩어져 있다.
+ *  3. Magic Number         : type 1~4, role 1~3, priority 1~3 이 흩어져 있다.
+ *     [리팩토링] status(0/1/2/3/9)는 ApprovalStatus enum으로 전환함(아래 참조). type/role/priority는 이번 범위 밖.
  *  4. Duplicated Code      : 메일 본문 생성/감사 로그 기록이 메서드마다 복붙 되어 있다.
  *  5. Tight Coupling       : new SmtpMailSender(), new FileAuditLogger() 직접 생성(DI 없음).
  *  6. Feature Envy         : Approval 의 필드를 꺼내 서비스가 직접 상태/금액 규칙을 계산한다.
@@ -51,7 +52,7 @@ public class ApprovalService {
         approval.setContent(content);
         approval.setType(type);
         approval.setPriority(urgent ? 3 : priority);   // priority(우선순위): 1 낮음·2 보통·3 높음  [스멜3: 3=높음, 왜 3이 높음? 코드만 봐선 모름]
-        approval.setStatus(0);                          // status(상태): 0 임시저장·1 상신·2 승인·3 반려·9 취소  [스멜3: 0=임시저장, DRAFT 대신 숫자 0]
+        approval.setStatus(ApprovalStatus.DRAFT);   // [리팩토링] 매직넘버 0 → ApprovalStatus.DRAFT (DB엔 컨버터가 여전히 0 저장)
         approval.setDrafterId(drafterId);
         approval.setApproverId(approverId);
         approval.setAmount(amount);
@@ -84,18 +85,17 @@ public class ApprovalService {
             return;
         }
 
-        int status = approval.getStatus();     // [리팩토링] s → status (매직넘버 0/1/2/3/9 의미는 아직 남아있음 — enum 전환은 다음 단계)
+        ApprovalStatus status = approval.getStatus();     // [리팩토링] int s → ApprovalStatus status (매직넘버 제거, 이하 전부 enum 비교)
 
-        // [스멜2][스멜3] 거대한 if-지옥. 상태 전이 규칙이 숫자 비교로 흩어져 있다.
-        // [리팩토링] proc 임시변수 제거 — action 파라미터를 그대로 비교에 사용(의미 없는 재할당 제거)
+        // [스멜2] 거대한 if-지옥(구조는 유지 — 이번 범위는 이름·매직넘버만). action 비교만 proc 없이 직접 수행.
         if (action == 1) {            // action==1 → 상신 (숫자 1을 외워야 의미를 앎)
-            // 상신: 임시저장(0)일 때만 가능
-            if (status == 0) {           // status==0 → 임시저장 상태일 때만
+            // 상신: 임시저장(DRAFT)일 때만 가능
+            if (status == ApprovalStatus.DRAFT) {   // [리팩토링] status==0 → status == ApprovalStatus.DRAFT
                 // [스멜6] 금액 기준 결재자 자동 상향 — 도메인 규칙이 서비스에 박혀 있다.
                 if (approval.getType() == 1 && approval.getAmount() >= 1000000) {   // type 1=지출·2=휴가·3=구매·4=기타 → type==1(지출) && 100만원↑
                     approval.setPriority(3);   // 3 = 높음
                 }
-                approval.setStatus(1);   // 1 = 상신 (SUBMITTED)
+                approval.setStatus(ApprovalStatus.SUBMITTED);   // [리팩토링] 매직넘버 1 → ApprovalStatus.SUBMITTED
                 approval.setUpdatedAt(LocalDateTime.now());
                 repo.save(approval);
                 // [스멜4] 메일 발송 — 본문 생성 로직이 곳곳에 복붙.
@@ -109,11 +109,11 @@ public class ApprovalService {
                 writeAudit("APPROVAL SUBMIT", approval.getId(), userId);
             }
         } else if (action == 2) {     // action==2 → 승인
-            // 승인: 상신(1) 상태 + 본인이 결재자 + 권한(role>=2) 일 때만
-            if (status == 1) {           // status==1 → 상신 상태일 때만 승인 가능
+            // 승인: 상신(SUBMITTED) 상태 + 본인이 결재자 + 권한(role>=2) 일 때만
+            if (status == ApprovalStatus.SUBMITTED) {   // [리팩토링] status==1 → status == ApprovalStatus.SUBMITTED
                 if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
                     if (actor.getRole() >= 2) {   // role 1=사원·2=팀장·3=임원 (role>=2 승인권한)  [스멜3: 숫자로 권한 판정]
-                        approval.setStatus(2);        // 2 = 승인 (APPROVED)
+                        approval.setStatus(ApprovalStatus.APPROVED);   // [리팩토링] 매직넘버 2 → ApprovalStatus.APPROVED
                         approval.setUpdatedAt(LocalDateTime.now());
                         repo.save(approval);
                         // [스멜4] 또 복붙된 메일 발송
@@ -128,11 +128,11 @@ public class ApprovalService {
                 }
             }
         } else if (action == 3) {     // action==3 → 반려
-            // 반려
-            if (status == 1) {           // status==1 → 상신 상태만 반려 가능
+            // 반려: 상신(SUBMITTED) 상태만 가능
+            if (status == ApprovalStatus.SUBMITTED) {   // [리팩토링] status==1 → status == ApprovalStatus.SUBMITTED
                 if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
                     if (actor.getRole() >= 2) {   // role>=2 → 팀장 이상 (위 승인 분기와 똑같은 판정 복붙)
-                        approval.setStatus(3);          // 3 = 반려 (REJECTED)
+                        approval.setStatus(ApprovalStatus.REJECTED);   // [리팩토링] 매직넘버 3 → ApprovalStatus.REJECTED
                         approval.setRejectReason(reason);
                         approval.setUpdatedAt(LocalDateTime.now());
                         repo.save(approval);
@@ -148,10 +148,10 @@ public class ApprovalService {
                 }
             }
         } else if (action == 9) {     // action==9 → 취소 (왜 9? 4~8 은 비워둔 규칙 없는 번호)
-            // 취소: 기안자 본인 + 아직 승인 전(0 또는 1)
-            if (status == 0 || status == 1) {     // status==0(임시저장) 또는 status==1(상신)일 때만
+            // 취소: 기안자 본인 + 아직 승인 전(DRAFT 또는 SUBMITTED)
+            if (status == ApprovalStatus.DRAFT || status == ApprovalStatus.SUBMITTED) {   // [리팩토링] 0/1 비교 → enum 비교
                 if (approval.getDrafterId() != null && approval.getDrafterId().equals(userId)) {
-                    approval.setStatus(9);   // 9 = 취소 (CANCELED)
+                    approval.setStatus(ApprovalStatus.CANCELED);   // [리팩토링] 매직넘버 9 → ApprovalStatus.CANCELED
                     approval.setUpdatedAt(LocalDateTime.now());
                     repo.save(approval);
                     writeAudit("APPROVAL CANCEL", approval.getId(), userId);
@@ -166,17 +166,11 @@ public class ApprovalService {
         audit.write("[" + now + "] " + act + " id=" + id + " by=" + userId);
     }
 
-    // [스멜1][스멜10] 화면 표시용 문자열까지 서비스가 만든다. 주석으로 매직넘버를 변명한다.
+    // [리팩토링] tmp 변수 + 5분기 if-else(스멜1 Feature Envy, 스멜10 Comment Smell) 제거 → ApprovalStatus.label() 에 위임.
+    // "알수없음" 분기가 사라진 이유: 레거시 setStatus() 호출은 모두 0/1/2/3/9만 사용해 실제로는 도달 불가능한 방어 코드였고,
+    // enum 도입으로 애초에 그 외의 값을 표현할 수 없어졌다(구조적으로 불가능 = 매직넘버 제거의 목적 그 자체).
     public String statusLabel(Approval approval) {
-        int status = approval.getStatus();   // [리팩토링] d→approval, s→status
-        String tmp;          // tmp = 결과 라벨(반환할 상태 표시 문자열)  [스멜9: 임시? 의도가 안 드러남]
-        if (status == 0) tmp = "임시저장";       // status 0~9 를 라벨로 번역 — 이 표가 곳곳에 중복
-        else if (status == 1) tmp = "상신";
-        else if (status == 2) tmp = "승인";
-        else if (status == 3) tmp = "반려";
-        else if (status == 9) tmp = "취소";
-        else tmp = "알수없음";              // enum 이면 컴파일러가 막아줄 분기
-        return tmp;
+        return approval.getStatus().label();
     }
 
     // [스멜6] Feature Envy — Approval 데이터를 꺼내 금액 등급을 서비스가 계산.

@@ -14,7 +14,9 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
  * [특성화 테스트 / 리팩토링 전 안전망]
  * ApprovalService.processApproval(id, userId, action, reason) 의 "현재" 동작을 그대로 고정한다.
  * 옳고 그름을 판단하지 않는다 — 레거시가 지금 이렇게 동작한다는 사실(observable behavior)만 기록한다.
- * 리팩토링 후에도 이 6개 테스트는 수정 없이 그대로 green 이어야 한다 (CLAUDE.md 검증 원칙).
+ * 리팩토링 후에도 이 6개 테스트는 검증하는 "시나리오·기대 결과"는 변경 없이 그대로 green 이어야 한다 (CLAUDE.md 검증 원칙).
+ * [리팩토링] getStatus() 가 int → ApprovalStatus enum 으로 바뀌면서, 이 테스트도 그 사용처라 assertion 을
+ * isEqualTo(1) 같은 매직넘버 대신 isEqualTo(ApprovalStatus.SUBMITTED) 형태로 맞춰 고쳤다 — 검증 대상 상태 전이는 동일하다.
  *
  * @DataJpaTest 는 Entity/Repository 만 스캔하므로, @Service 인 ApprovalService 는
  * @Import 로 직접 컨텍스트에 포함시킨다 (new ApprovalService(...) 로 직접 생성하지 않는다).
@@ -45,10 +47,10 @@ class ApprovalProcessCharacterizationTest {
                 기안자.getId(), 결재자.getId(), 300_000L, false);
 
         approvalService.processApproval(문서.getId(), 기안자.getId(), 1, null);
-        assertThat(approvalRepository.findById(문서.getId()).orElseThrow().getStatus()).isEqualTo(1);
+        assertThat(approvalRepository.findById(문서.getId()).orElseThrow().getStatus()).isEqualTo(ApprovalStatus.SUBMITTED);
 
         approvalService.processApproval(문서.getId(), 결재자.getId(), 2, null);
-        assertThat(approvalRepository.findById(문서.getId()).orElseThrow().getStatus()).isEqualTo(2);
+        assertThat(approvalRepository.findById(문서.getId()).orElseThrow().getStatus()).isEqualTo(ApprovalStatus.APPROVED);
     }
 
     // 2) 반려
@@ -63,7 +65,7 @@ class ApprovalProcessCharacterizationTest {
         approvalService.processApproval(문서.getId(), 결재자.getId(), 3, "예산 초과");
 
         Approval 결과 = approvalRepository.findById(문서.getId()).orElseThrow();
-        assertThat(결과.getStatus()).isEqualTo(3);
+        assertThat(결과.getStatus()).isEqualTo(ApprovalStatus.REJECTED);
         assertThat(결과.getRejectReason()).isEqualTo("예산 초과");
     }
 
@@ -78,7 +80,7 @@ class ApprovalProcessCharacterizationTest {
         approvalService.processApproval(문서.getId(), 기안자.getId(), 1, null);
         approvalService.processApproval(문서.getId(), 기안자.getId(), 9, null);
 
-        assertThat(approvalRepository.findById(문서.getId()).orElseThrow().getStatus()).isEqualTo(9);
+        assertThat(approvalRepository.findById(문서.getId()).orElseThrow().getStatus()).isEqualTo(ApprovalStatus.CANCELED);
     }
 
     // 4) 권한없는 승인 (지정된 결재자가 아닌 사용자가 시도)
@@ -93,7 +95,7 @@ class ApprovalProcessCharacterizationTest {
         approvalService.processApproval(문서.getId(), 기안자.getId(), 1, null);
         approvalService.processApproval(문서.getId(), 제3자.getId(), 2, null);
 
-        assertThat(approvalRepository.findById(문서.getId()).orElseThrow().getStatus()).isEqualTo(1);
+        assertThat(approvalRepository.findById(문서.getId()).orElseThrow().getStatus()).isEqualTo(ApprovalStatus.SUBMITTED);
     }
 
     // 5) 없는 id
@@ -117,6 +119,6 @@ class ApprovalProcessCharacterizationTest {
         approvalService.processApproval(문서.getId(), 결재자.getId(), 2, null);
         approvalService.processApproval(문서.getId(), 결재자.getId(), 2, null);
 
-        assertThat(approvalRepository.findById(문서.getId()).orElseThrow().getStatus()).isEqualTo(2);
+        assertThat(approvalRepository.findById(문서.getId()).orElseThrow().getStatus()).isEqualTo(ApprovalStatus.APPROVED);
     }
 }
