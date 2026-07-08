@@ -16,9 +16,13 @@ import java.util.List;
  * ============================ 의도적으로 심어둔 스멜 목록 ============================
  *  1. God Class            : 검증 + 영속화 + 메일 + 감사로그 + 포맷팅 + 권한판정을 혼자 다 한다.
  *  2. Long Method          : processApproval() 한 메서드가 100줄 이상, 중첩 if 6단계.
+ *     [리팩토링] Guard Clause + Extract Method 로 submit/approve/reject/cancel/notifyApprover 로 분해함(아래 참조).
+ *     processApproval 은 약 86줄 → 약 12줄(조율부만 남김). 남은 God Class·중복 메일 발송은 이번 범위 밖.
  *  3. Magic Number         : type 1~4, role 1~3, priority 1~3 이 흩어져 있다.
  *     [리팩토링] status(0/1/2/3/9)는 ApprovalStatus enum으로 전환함(아래 참조). type/role/priority는 이번 범위 밖.
  *  4. Duplicated Code      : 메일 본문 생성/감사 로그 기록이 메서드마다 복붙 되어 있다.
+ *     [참고] submit() 의 결재자 메일 발송만 notifyApprover() 로 추출함 — approve/reject 의 드래프터 메일 발송은
+ *            서로 다른 수신자·본문이라 이번 챕터(메서드 분해) 범위에서는 그대로 둔다(중복 제거는 별도 챕터 대상).
  *  5. Tight Coupling       : new SmtpMailSender(), new FileAuditLogger() 직접 생성(DI 없음).
  *  6. Feature Envy         : Approval 의 필드를 꺼내 서비스가 직접 상태/금액 규칙을 계산한다.
  *  7. Primitive Obsession  : 모든 분기를 int 비교로 처리한다.
@@ -69,95 +73,121 @@ public class ApprovalService {
     }
 
     /**
-     * 결재 처리 — 상신/승인/반려/취소를 action 코드로 분기한다.
-     * [스멜2] 이 메서드 하나가 모든 일을 한다. [스멜1][스멜6] 규칙 계산을 서비스가 떠안는다.
+     * [리팩토링] 레거시 중첩 if-지옥(약 86줄, 중첩 4~5단계) → Guard Clause + Extract Method 로 분해.
+     * (KT DS 클린코드&리팩토링 Day1 교재 7장 "메서드 수준 리팩토링" 그대로 적용)
+     *
+     * - processApproval 은 "누구를 부를지"만 결정하는 조율부로 슬림화 (action → submit/approve/reject/cancel 위임).
+     * - public 시그니처(id, userId, action, reason)·리턴 타입·호출부는 절대 안 바꿈 (불변 규칙).
+     * - 각 상태 전이 규칙(가드 조건)·DB 저장값·메일·감사로그는 원래 로직과 1:1 그대로 옮김 — 동작 변경 없음.
      *
      * action: 1=상신, 2=승인, 3=반려, 9=취소
      */
     public void processApproval(Long id, Long userId, int action, String reason) {
-        Approval approval = repo.findById(id).orElse(null);   // [리팩토링] d → approval
-        if (approval == null) {
-            // [스멜] 예외 대신 조용히 리턴 — 호출자는 실패를 알 수 없다. (레거시 동작 보존 — 재설계 단계에서 다룰 대상)
-            return;
-        }
-        User actor = userRepo.findById(userId).orElse(null);   // [리팩토링] u → actor (요청을 수행하는 사용자라는 의미를 드러냄)
-        if (actor == null) {
-            return;
+        Approval approval = repo.findById(id).orElse(null);
+        User actor = userRepo.findById(userId).orElse(null);
+        // [리팩토링] 분리돼 있던 두 개의 null 가드(조기 반환)를 하나로 통합 — 이후 본문은 not-null 전제로 진행
+        if (approval == null || actor == null) {
+            return;   // [스멜] 예외 대신 조용히 리턴 — 호출자는 실패를 알 수 없다. (레거시 동작 보존 — 재설계 단계에서 다룰 대상)
         }
 
-        ApprovalStatus status = approval.getStatus();     // [리팩토링] int s → ApprovalStatus status (매직넘버 제거, 이하 전부 enum 비교)
-
-        // [스멜2] 거대한 if-지옥(구조는 유지 — 이번 범위는 이름·매직넘버만). action 비교만 proc 없이 직접 수행.
-        if (action == 1) {            // action==1 → 상신 (숫자 1을 외워야 의미를 앎)
-            // 상신: 임시저장(DRAFT)일 때만 가능
-            if (status == ApprovalStatus.DRAFT) {   // [리팩토링] status==0 → status == ApprovalStatus.DRAFT
-                // [스멜6] 금액 기준 결재자 자동 상향 — 도메인 규칙이 서비스에 박혀 있다.
-                if (approval.getType() == 1 && approval.getAmount() >= 1000000) {   // type 1=지출·2=휴가·3=구매·4=기타 → type==1(지출) && 100만원↑
-                    approval.setPriority(3);   // 3 = 높음
-                }
-                approval.setStatus(ApprovalStatus.SUBMITTED);   // [리팩토링] 매직넘버 1 → ApprovalStatus.SUBMITTED
-                approval.setUpdatedAt(LocalDateTime.now());
-                repo.save(approval);
-                // [스멜4] 메일 발송 — 본문 생성 로직이 곳곳에 복붙.
-                User approver = userRepo.findById(approval.getApproverId()).orElse(null);
-                if (approver != null) {
-                    String body = "안녕하세요 " + approver.getName() + "님,\n"
-                            + "결재 요청이 도착했습니다.\n제목: " + approval.getTitle()
-                            + "\n기안자ID: " + approval.getDrafterId();
-                    mail.send(approver.getEmail(), "[결재요청] " + approval.getTitle(), body);
-                }
-                writeAudit("APPROVAL SUBMIT", approval.getId(), userId);
-            }
-        } else if (action == 2) {     // action==2 → 승인
-            // 승인: 상신(SUBMITTED) 상태 + 본인이 결재자 + 권한(role>=2) 일 때만
-            if (status == ApprovalStatus.SUBMITTED) {   // [리팩토링] status==1 → status == ApprovalStatus.SUBMITTED
-                if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
-                    if (actor.getRole() >= 2) {   // role 1=사원·2=팀장·3=임원 (role>=2 승인권한)  [스멜3: 숫자로 권한 판정]
-                        approval.setStatus(ApprovalStatus.APPROVED);   // [리팩토링] 매직넘버 2 → ApprovalStatus.APPROVED
-                        approval.setUpdatedAt(LocalDateTime.now());
-                        repo.save(approval);
-                        // [스멜4] 또 복붙된 메일 발송
-                        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
-                        if (drafter != null) {
-                            String body = "안녕하세요 " + drafter.getName() + "님,\n"
-                                    + "결재가 승인되었습니다.\n제목: " + approval.getTitle();
-                            mail.send(drafter.getEmail(), "[결재승인] " + approval.getTitle(), body);
-                        }
-                        writeAudit("APPROVAL APPROVE", approval.getId(), userId);
-                    }
-                }
-            }
-        } else if (action == 3) {     // action==3 → 반려
-            // 반려: 상신(SUBMITTED) 상태만 가능
-            if (status == ApprovalStatus.SUBMITTED) {   // [리팩토링] status==1 → status == ApprovalStatus.SUBMITTED
-                if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
-                    if (actor.getRole() >= 2) {   // role>=2 → 팀장 이상 (위 승인 분기와 똑같은 판정 복붙)
-                        approval.setStatus(ApprovalStatus.REJECTED);   // [리팩토링] 매직넘버 3 → ApprovalStatus.REJECTED
-                        approval.setRejectReason(reason);
-                        approval.setUpdatedAt(LocalDateTime.now());
-                        repo.save(approval);
-                        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
-                        if (drafter != null) {
-                            String body = "안녕하세요 " + drafter.getName() + "님,\n"
-                                    + "결재가 반려되었습니다.\n제목: " + approval.getTitle()
-                                    + "\n사유: " + reason;
-                            mail.send(drafter.getEmail(), "[결재반려] " + approval.getTitle(), body);
-                        }
-                        writeAudit("APPROVAL REJECT", approval.getId(), userId);
-                    }
-                }
-            }
-        } else if (action == 9) {     // action==9 → 취소 (왜 9? 4~8 은 비워둔 규칙 없는 번호)
-            // 취소: 기안자 본인 + 아직 승인 전(DRAFT 또는 SUBMITTED)
-            if (status == ApprovalStatus.DRAFT || status == ApprovalStatus.SUBMITTED) {   // [리팩토링] 0/1 비교 → enum 비교
-                if (approval.getDrafterId() != null && approval.getDrafterId().equals(userId)) {
-                    approval.setStatus(ApprovalStatus.CANCELED);   // [리팩토링] 매직넘버 9 → ApprovalStatus.CANCELED
-                    approval.setUpdatedAt(LocalDateTime.now());
-                    repo.save(approval);
-                    writeAudit("APPROVAL CANCEL", approval.getId(), userId);
-                }
-            }
+        // [리팩토링] switch(action) 이 "누구를 부를지"만 결정 — 상태 전이 규칙은 각 메서드 안으로 이동
+        switch (action) {
+            case 1 -> submit(approval, actor);
+            case 2 -> approve(approval, actor);
+            case 3 -> reject(approval, actor, reason);
+            case 9 -> cancel(approval, actor);
+            // 1/2/3/9 외의 값은 레거시와 동일하게 아무 분기도 타지 않고 조용히 끝난다(default 없음 = 원래도 없던 동작)
         }
+    }
+
+    // [리팩토링] 메서드 추출 - 상신 처리만 하는 메서드. 가드 절로 "임시저장이 아니면 조기 반환".
+    private void submit(Approval approval, User actor) {
+        if (approval.getStatus() != ApprovalStatus.DRAFT) {   // 예: 이미 상신/승인된 문서면 여기서 조기 반환(원래 로직과 동일)
+            return;
+        }
+        // [스멜6] 금액 기준 결재자 자동 상향 — 도메인 규칙이 서비스에 박혀 있다.
+        if (approval.getType() == 1 && approval.getAmount() >= 1000000) {   // type 1=지출·2=휴가·3=구매·4=기타 → type==1(지출) && 100만원↑
+            approval.setPriority(3);   // 3 = 높음
+        }
+        approval.setStatus(ApprovalStatus.SUBMITTED);
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+        notifyApprover(approval);   // [리팩토링] 메일 발송 블록을 메서드로 추출(교재 7-9 "메일 공통화")
+        writeAudit("APPROVAL SUBMIT", approval.getId(), actor.getId());
+    }
+
+    // [리팩토링] 메서드 추출 - submit() 에서만 쓰는 결재자 알림 메일. 블록 1개 = 메서드 1개(이름이 주석 대체).
+    private void notifyApprover(Approval approval) {
+        User approver = userRepo.findById(approval.getApproverId()).orElse(null);
+        if (approver != null) {
+            String body = "안녕하세요 " + approver.getName() + "님,\n"
+                    + "결재 요청이 도착했습니다.\n제목: " + approval.getTitle()
+                    + "\n기안자ID: " + approval.getDrafterId();
+            mail.send(approver.getEmail(), "[결재요청] " + approval.getTitle(), body);
+        }
+    }
+
+    // [리팩토링] 메서드 추출 - 승인 처리. 중첩 if 3단(상태·본인·권한) → 가드 절 3개로 평탄화.
+    private void approve(Approval approval, User actor) {
+        if (approval.getStatus() != ApprovalStatus.SUBMITTED) {   // 상신 상태일 때만 승인 가능
+            return;
+        }
+        if (approval.getApproverId() == null || !approval.getApproverId().equals(actor.getId())) {   // 지정 결재자 본인만
+            return;
+        }
+        if (actor.getRole() < 2) {   // role 1=사원·2=팀장·3=임원 (role>=2 승인권한)  [스멜3: 숫자로 권한 판정]
+            return;
+        }
+        approval.setStatus(ApprovalStatus.APPROVED);
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+        // [스멜4] 복붙된 메일 발송 — approve/reject 는 수신자·본문이 달라 이번 챕터에서는 추출하지 않음(위 클래스 주석 참조)
+        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
+        if (drafter != null) {
+            String body = "안녕하세요 " + drafter.getName() + "님,\n"
+                    + "결재가 승인되었습니다.\n제목: " + approval.getTitle();
+            mail.send(drafter.getEmail(), "[결재승인] " + approval.getTitle(), body);
+        }
+        writeAudit("APPROVAL APPROVE", approval.getId(), actor.getId());
+    }
+
+    // [리팩토링] 메서드 추출 - 반려 처리. approve() 와 동일한 가드 3단(스멜4 중복은 그대로 보존).
+    private void reject(Approval approval, User actor, String reason) {
+        if (approval.getStatus() != ApprovalStatus.SUBMITTED) {   // 상신 상태만 반려 가능
+            return;
+        }
+        if (approval.getApproverId() == null || !approval.getApproverId().equals(actor.getId())) {   // 지정 결재자 본인만
+            return;
+        }
+        if (actor.getRole() < 2) {   // role>=2 → 팀장 이상
+            return;
+        }
+        approval.setStatus(ApprovalStatus.REJECTED);
+        approval.setRejectReason(reason);
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
+        if (drafter != null) {
+            String body = "안녕하세요 " + drafter.getName() + "님,\n"
+                    + "결재가 반려되었습니다.\n제목: " + approval.getTitle()
+                    + "\n사유: " + reason;
+            mail.send(drafter.getEmail(), "[결재반려] " + approval.getTitle(), body);
+        }
+        writeAudit("APPROVAL REJECT", approval.getId(), actor.getId());
+    }
+
+    // [리팩토링] 메서드 추출 - 취소 처리. 기안자 본인 + 아직 승인 전(DRAFT 또는 SUBMITTED)만 허용.
+    private void cancel(Approval approval, User actor) {
+        if (approval.getStatus() != ApprovalStatus.DRAFT && approval.getStatus() != ApprovalStatus.SUBMITTED) {
+            return;
+        }
+        if (approval.getDrafterId() == null || !approval.getDrafterId().equals(actor.getId())) {
+            return;
+        }
+        approval.setStatus(ApprovalStatus.CANCELED);
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+        writeAudit("APPROVAL CANCEL", approval.getId(), actor.getId());
     }
 
     // [스멜4] 그나마 추출했지만 create() 안에는 또 복붙이 남아 있다(불완전한 중복 제거).
